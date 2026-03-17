@@ -74,8 +74,6 @@ foreign gdi32 {
 	GdiGradientFill   :: proc(hdc: HDC, pVertex: PTRIVERTEX, nVertex: ULONG, pMesh: PVOID, nCount: ULONG, ulMode: ULONG) -> BOOL ---
 	GdiAlphaBlend     :: proc(hdcDest: HDC, xoriginDest, yoriginDest, wDest, hDest: INT, hdcSrc: HDC, xoriginSrc, yoriginSrc, wSrc, hSrc: INT, ftn: BLENDFUNCTION) -> BOOL ---
 
-	CreateBitmap      :: proc(nWidth, nHeight: INT, nPlanes, nBitCount: UINT, lpBits: rawptr) -> HBITMAP ---
-
 	// Filled Shape Functions
 	Rectangle   :: proc(hdc: HDC, left, top, right, bottom: c_int) -> BOOL ---
 	Ellipse     :: proc(hdc: HDC, left, top, right, bottom: c_int) -> BOOL ---
