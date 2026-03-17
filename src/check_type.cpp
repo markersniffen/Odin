@@ -117,6 +117,10 @@ gb_internal void check_struct_fields(CheckerContext *ctx, Ast *node, Slice<Entit
 		}
 	}
 
+	// Allocate all at once
+	Entity *entities_to_use = permanent_alloc_array<Entity>(variable_count);
+	isize entities_to_use_index = 0;
+
 	i32 field_src_index = 0;
 	i32 field_group_index = -1;
 	for_array(i, params) {
@@ -165,7 +169,14 @@ gb_internal void check_struct_fields(CheckerContext *ctx, Ast *node, Slice<Entit
 			}
 			Token name_token = name->Ident.token;
 
-			Entity *field = alloc_entity_field(ctx->scope, name_token, type, is_using, field_src_index);
+			// Entity *field = alloc_entity_field(ctx->scope, name_token, type, is_using, field_src_index);
+			Entity *field = &entities_to_use[entities_to_use_index++];
+			INTERNAL_ENTITY_INIT(field, Entity_Variable, ctx->scope, name_token, type);
+			field->state = EntityState_Unresolved;
+			field->flags |= EntityFlag_Field;
+			if (is_using) field->flags |= EntityFlag_Using;
+			field->Variable.field_index = field_src_index;
+
 			add_entity(ctx, ctx->scope, name, field);
 			field->Variable.field_group_index = field_group_index;
 			if (is_subtype) {
@@ -272,7 +283,7 @@ gb_internal GenTypesData *ensure_polymorphic_record_entity_has_gen_types(Checker
 	GB_ASSERT(original_type->kind == Type_Named);
 	mutex_lock(&original_type->Named.gen_types_data_mutex);
 	if (original_type->Named.gen_types_data == nullptr) {
-		GenTypesData *gen_types = gb_alloc_item(permanent_allocator(), GenTypesData);
+		GenTypesData *gen_types = permanent_alloc_item<GenTypesData>();
 		gen_types->types = array_make<Entity *>(heap_allocator());
 		original_type->Named.gen_types_data = gen_types;
 	}
@@ -636,7 +647,7 @@ gb_internal void check_struct_type(CheckerContext *ctx, Type *struct_type, Ast *
 
 	isize min_field_count = 0;
 	for_array(field_index, st->fields) {
-	Ast *field = st->fields[field_index];
+		Ast *field = st->fields[field_index];
 		switch (field->kind) {
 		case_ast_node(f, ValueDecl, field);
 			min_field_count += f->names.count;
@@ -679,6 +690,21 @@ gb_internal void check_struct_type(CheckerContext *ctx, Type *struct_type, Ast *
 			gb_unused(where_clause_ok);
 		}
 		check_struct_fields(ctx, node, &struct_type->Struct.fields, &struct_type->Struct.tags, st->fields, min_field_count, struct_type, context);
+
+		if (st->is_simple) {
+			bool success = true;
+			for (Entity *f : struct_type->Struct.fields) {
+				if (!is_type_nearly_simple_compare(f->type)) {
+					gbString s = type_to_string(f->type);
+					error(f->token, "'struct #simple' requires all fields to be at least 'nearly simple compare', got %s", s);
+					gb_string_free(s);
+				}
+			}
+			if (success) {
+				struct_type->Struct.is_simple = true;
+			}
+		}
+
 		wait_signal_set(&struct_type->Struct.fields_wait_signal);
 	}
 
@@ -872,6 +898,10 @@ gb_internal void check_enum_type(CheckerContext *ctx, Type *enum_type, Type *nam
 
 	scope_reserve(ctx->scope, et->fields.count);
 
+	// Allocate all at once
+	Entity *entities_to_use = permanent_alloc_array<Entity>(et->fields.count);
+	isize entities_to_use_index = 0;
+
 	for_array(i, et->fields) {
 		Ast *field = et->fields[i];
 		Ast *ident = nullptr;
@@ -916,9 +946,6 @@ gb_internal void check_enum_type(CheckerContext *ctx, Type *enum_type, Type *nam
 		// NOTE(bill): Skip blank identifiers
 		if (is_blank_ident(name)) {
 			continue;
-		} else if (name == "names") {
-			error(field, "'names' is a reserved identifier for enumerations");
-			continue;
 		}
 
 		if (min_value_set) {
@@ -942,7 +969,11 @@ gb_internal void check_enum_type(CheckerContext *ctx, Type *enum_type, Type *nam
 			max_value_set = true;
 		}
 
-		Entity *e = alloc_entity_constant(ctx->scope, ident->Ident.token, constant_type, iota);
+		// Entity *e = alloc_entity_constant(ctx->scope, ident->Ident.token, constant_type, iota);
+		Entity *e = &entities_to_use[entities_to_use_index++];
+		Token token = ident->Ident.token;
+		INTERNAL_ENTITY_INIT(e, Entity_Constant, ctx->scope, token, constant_type);
+		e->Constant.value = iota;
 		e->identifier = ident;
 		e->flags |= EntityFlag_Visited;
 		e->state = EntityState_Resolved;
@@ -1214,6 +1245,7 @@ gb_internal void check_bit_set_type(CheckerContext *c, Type *type, Type *named_t
 	ast_node(bs, BitSetType, node);
 	GB_ASSERT(type->kind == Type_BitSet);
 	type->BitSet.node = node;
+	type->BitSet.elem = t_invalid;
 
 	/* i64 const DEFAULT_BITS = cast(i64)(8*build_context.word_size); */
 	i64 const MAX_BITS = 128;
@@ -1830,11 +1862,14 @@ gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_para
 		Type *specialization = nullptr;
 
 		bool is_using = (p->flags&FieldFlag_using) != 0;
-		if ((check_vet_flags(param) & VetFlag_UsingParam) && is_using) {
-			ERROR_BLOCK();
-			error(param, "'using' on a procedure parameter is not allowed when '-vet' or '-vet-using-param' is applied");
-			error_line("\t'using' is considered bad practice to use as a statement/procedure parameter outside of immediate refactoring\n");
 
+
+		u64 feature_flags = check_feature_flags(ctx, param);
+
+		if (is_using && (feature_flags & OptInFeatureFlag_UsingStmt) == 0) {
+			ERROR_BLOCK();
+			error(param, "'using' has been disallowed as it is considered bad practice to use as a statement/procedure parameter outside of immediate refactoring");
+			error_line("\tIf you do require it for refactoring purposes or legacy code, it can be enabled on a per-file basis with '#+feature using-stmt'\n");
 		}
 
 		if (type_expr == nullptr) {
@@ -2287,6 +2322,57 @@ gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_para
 	return tuple;
 }
 
+// Check if an AST node references any polymorphic type parameters
+// TODO(bill): is this even complete enough?
+gb_internal bool ast_references_poly_params(Scope *scope, Ast *node) {
+	if (node == nullptr) {
+		return false;
+	}
+	switch (node->kind) {
+	case Ast_Ident: {
+		String name = node->Ident.token.string;
+		Entity *e = scope_lookup(scope, name);
+		if (e != nullptr && e->kind == Entity_TypeName && e->type != nullptr && e->type->kind == Type_Generic) {
+			return true;
+		}
+		return false;
+	}
+	case Ast_SelectorExpr:
+		return ast_references_poly_params(scope, node->SelectorExpr.expr);
+	case Ast_IndexExpr:
+		return ast_references_poly_params(scope, node->IndexExpr.expr);
+	case Ast_CallExpr:
+		for (Ast *arg : node->CallExpr.args) {
+			if (ast_references_poly_params(scope, arg)) {
+				return true;
+			}
+		}
+		return ast_references_poly_params(scope, node->CallExpr.proc);
+	case Ast_CompoundLit:
+		return ast_references_poly_params(scope, node->CompoundLit.type);
+	case Ast_UnaryExpr:
+		return ast_references_poly_params(scope, node->UnaryExpr.expr);
+	case Ast_ParenExpr:
+		return ast_references_poly_params(scope, node->ParenExpr.expr);
+	case Ast_DerefExpr:
+		return ast_references_poly_params(scope, node->DerefExpr.expr);
+	case Ast_PointerType:
+		return ast_references_poly_params(scope, node->PointerType.type);
+	case Ast_ArrayType:
+		return ast_references_poly_params(scope, node->ArrayType.elem) ||
+		       ast_references_poly_params(scope, node->ArrayType.count);
+	case Ast_FixedCapacityDynamicArrayType:
+		return ast_references_poly_params(scope, node->FixedCapacityDynamicArrayType.elem) ||
+		       ast_references_poly_params(scope, node->FixedCapacityDynamicArrayType.capacity);
+       case Ast_DynamicArrayType:
+	       	return ast_references_poly_params(scope, node->DynamicArrayType.elem);
+	case Ast_MapType:
+		return ast_references_poly_params(scope, node->MapType.key) ||
+		       ast_references_poly_params(scope, node->MapType.value);
+	}
+	return false;
+}
+
 gb_internal Type *check_get_results(CheckerContext *ctx, Scope *scope, Ast *_results) {
 	if (_results == nullptr) {
 		return nullptr;
@@ -2321,7 +2407,12 @@ gb_internal Type *check_get_results(CheckerContext *ctx, Scope *scope, Ast *_res
 		if (field->type == nullptr) {
 			param_value = handle_parameter_value(ctx, nullptr, &type, default_value, false);
 		} else {
-			type = check_type(ctx, field->type);
+			if (ctx->allow_polymorphic_types && ast_references_poly_params(ctx->scope, field->type)) {
+				type = alloc_type_generic(ctx->scope, 0, str_lit("$deferred_return"), nullptr);
+			} else {
+				type = check_type(ctx, field->type);
+			}
+
 
 			if (default_value != nullptr) {
 				param_value = handle_parameter_value(ctx, type, nullptr, default_value, false);
@@ -3130,7 +3221,7 @@ gb_internal Type *make_soa_struct_internal(CheckerContext *ctx, Ast *array_typ_e
 		soa_struct->Struct.fields = permanent_slice_make<Entity *>(field_count+extra_field_count);
 		soa_struct->Struct.tags = gb_alloc_array(permanent_allocator(), String, field_count+extra_field_count);
 
-		string_map_init(&scope->elements, 8);
+		scope_map_init(&scope->elements);
 
 		String params_xyzw[4] = {
 			str_lit("x"),
@@ -3228,7 +3319,7 @@ gb_internal Type *make_soa_struct_internal(CheckerContext *ctx, Ast *array_typ_e
 		add_type_info_type(ctx, soa_struct);
 		wait_signal_set(&soa_struct->Struct.fields_wait_signal);
 	} else {
-		SoaTypeWorkerData *wd = gb_alloc_item(permanent_allocator(), SoaTypeWorkerData);
+		SoaTypeWorkerData *wd = permanent_alloc_item<SoaTypeWorkerData>();
 		wd->ctx = *ctx;
 		wd->type = soa_struct;
 		wd->wait_to_finish = true;
@@ -3623,6 +3714,31 @@ gb_internal bool check_type_internal(CheckerContext *ctx, Ast *e, Type **type, T
 		return true;
 	case_end;
 
+	case_ast_node(dat, FixedCapacityDynamicArrayType, e);
+		Operand o = {};
+		i64 capacity = check_array_count(ctx, &o, dat->capacity);
+		Type *generic_type = nullptr;
+		if (o.mode == Addressing_Type && o.type->kind == Type_Generic) {
+			generic_type = o.type;
+		}
+
+		if (capacity < 0) {
+			error(dat->capacity, "? can only be used in conjunction with compound literals of fixed-length arrays");
+			capacity = 0;
+		}
+
+
+		Type *elem = check_type(ctx, dat->elem);
+		if (dat->tag != nullptr) {
+			GB_ASSERT(dat->tag->kind == Ast_BasicDirective);
+			String name = dat->tag->BasicDirective.name.string;
+			error(dat->tag, "Invalid tag applied to fixed capacity dynamic array, got #%.*s", LIT(name));
+		}
+		*type = alloc_type_fixed_capacity_dynamic_array(elem, capacity, generic_type);
+		set_base_type(named_type, *type);
+		return true;
+	case_end;
+
 	case_ast_node(st, StructType, e);
 		CheckerContext c = *ctx;
 		c.in_polymorphic_specialization = false;
@@ -3750,6 +3866,20 @@ gb_internal bool check_type_internal(CheckerContext *ctx, Ast *e, Type **type, T
 		set_base_type(named_type, *type);
 		return true;
 	case_end;
+
+	default: {
+		Operand	o = {};
+		check_expr_base(ctx, &o, e, nullptr);
+
+		if (o.mode == Addressing_Constant &&
+		    o.value.kind == ExactValue_Typeid) {
+			Type *t = o.value.value_typeid;
+			if (t != nullptr && t != t_invalid) {
+				*type = t;
+				return true;
+			}
+		}
+	}
 	}
 
 	*type = t_invalid;

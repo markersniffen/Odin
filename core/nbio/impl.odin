@@ -5,12 +5,11 @@ import "base:runtime"
 import "base:intrinsics"
 
 import "core:container/pool"
-import "core:container/queue"
 import "core:net"
-import "core:strings"
-import "core:sync"
-import "core:time"
 import "core:reflect"
+import "core:slice"
+import "core:strings"
+import "core:time"
 
 @(init, private)
 init_thread_local_cleaner :: proc "contextless" () {
@@ -35,7 +34,13 @@ _acquire_thread_event_loop :: proc() -> General_Error {
 			allocator := runtime.heap_allocator()
 		}
 
-		l.queue.data.allocator =  allocator
+		l.allocator = allocator
+
+		if alloc_err := mpsc_init(&l.queue, 128, l.allocator); alloc_err != nil {
+			l.err = .Allocation_Failed
+			return l.err
+		}
+		defer if l.err != nil { mpsc_destroy(&l.queue, l.allocator) }
 
 		if pool_err := pool.init(&l.operation_pool, "_pool_link"); pool_err != nil {
 			l.err = .Allocation_Failed
@@ -65,7 +70,7 @@ _release_thread_event_loop :: proc() {
 	if l.refs > 0 {
 		l.refs -= 1
 		if l.refs == 0 {
-			queue.destroy(&l.queue)
+			mpsc_destroy(&l.queue, l.allocator)
 			pool.destroy(&l.operation_pool)
 			_destroy(l)
 			l^ = {}
@@ -85,11 +90,10 @@ _current_thread_event_loop :: #force_inline proc(loc := #caller_location) -> (^E
 
 _tick :: proc(l: ^Event_Loop, timeout: time.Duration) -> (err: General_Error) {
 	// Receive operations queued from other threads first.
-	{
-		sync.guard(&l.queue_mu)
-		for op in queue.pop_front_safe(&l.queue) {
-			_exec(op)
-		}
+	for {
+		op := (^Operation)(mpsc_dequeue(&l.queue))
+		if op == nil { break }
+		_exec(op)
 	}
 
 	return __tick(l, timeout)
@@ -233,6 +237,64 @@ warn :: proc(text: string, location := #caller_location) {
 	}
 
 	context.logger.procedure(context.logger.data, .Warning, text, context.logger.options, location)
+}
+
+/*
+In order to:
+1. Not require the caller to allocate their buffers (`op.send.bufs` and `op.recv.bufs` can be stack allocated)
+2. Have `op.send.bufs` and `op.recv.bufs` be valid and the same content in the callback as when called
+3. Be able to facilitate the `all` option, which requires mutating the slices (advancing them)
+4. Constraint single send/recv syscalls to MAX_RW bytes
+
+We need to copy the input buffers twice, once for a stable copy returned to the user,
+and one for the working copy that we mutate with `all` set.
+*/
+
+Bufs :: struct {
+	backing: [1][]byte,
+	working: struct #raw_union {
+		small: [1][]byte,
+		big:   [][]byte,
+	},
+}
+
+bufs_init :: proc(bufs: ^Bufs, orig: ^[][]byte, allocator: runtime.Allocator) -> runtime.Allocator_Error {
+	if len(orig) > 1 {
+		backing := make([][]byte, len(orig)*2, allocator) or_return
+		bufs.working.big = backing[len(orig):]
+		copy(bufs.working.big, orig^)
+		copy(backing, orig^)
+		orig^ = backing[:len(orig)]
+		return nil
+	}
+
+	bufs.backing = {orig[0]}
+	orig^ = bufs.backing[:]
+	return nil
+}
+
+bufs_delete :: proc(bufs: ^Bufs, orig: [][]byte, allocator: runtime.Allocator) {
+	if len(orig) > 1 {
+		backing := raw_data(orig)[:len(orig)*2]
+		delete(backing, allocator)
+	}
+}
+
+@(require_results)
+bufs_to_process :: proc(bufs: ^Bufs, orig: [][]byte, processed: int) -> (working: [][]byte, total: int) {
+	if len(orig) > 1 {
+		// Reset to length and contents of backing, so a previous modification is removed.
+		(^runtime.Raw_Slice)(&bufs.working.big).len = len(orig)
+		copy(bufs.working.big, orig)
+		working = bufs.working.big
+	} else {
+		bufs.working.small = {orig[0]}
+		working = bufs.working.small[:]
+	}
+
+	working        = slice.advance_slices(working, processed)
+	working, total = constraint_bufs_to_max_rw(working)
+	return
 }
 
 @(require_results)

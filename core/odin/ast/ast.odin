@@ -432,6 +432,7 @@ For_Stmt :: struct {
 Range_Stmt :: struct {
 	using node: Stmt,
 	label:     ^Expr, // possibly nil
+	init:      ^Stmt,
 	for_pos:   tokenizer.Pos,
 	vals:      []^Expr,
 	in_pos:    tokenizer.Pos,
@@ -785,6 +786,16 @@ Dynamic_Array_Type :: struct {
 	elem:        ^Expr,
 }
 
+Fixed_Capacity_Dynamic_Array_Type :: struct {
+	using node:  Expr,
+	tag:         ^Expr, // possibly nil
+	open:        tokenizer.Pos,
+	dynamic_pos: tokenizer.Pos,
+	capacity:    ^Expr,
+	close:       tokenizer.Pos,
+	elem:        ^Expr,
+}
+
 Struct_Type :: struct {
 	using node: Expr,
 	tok_pos:         tokenizer.Pos,
@@ -798,6 +809,7 @@ Struct_Type :: struct {
 	is_raw_union:    bool,
 	is_no_copy:      bool,
 	is_all_or_none:  bool,
+	is_simple:       bool,
 	fields:          ^Field_List,
 	name_count:      int,
 }
@@ -929,6 +941,7 @@ Any_Node :: union {
 	^Multi_Pointer_Type,
 	^Array_Type,
 	^Dynamic_Array_Type,
+	^Fixed_Capacity_Dynamic_Array_Type,
 	^Struct_Type,
 	^Union_Type,
 	^Enum_Type,
@@ -1015,6 +1028,7 @@ Any_Expr :: union {
 	^Multi_Pointer_Type,
 	^Array_Type,
 	^Dynamic_Array_Type,
+	^Fixed_Capacity_Dynamic_Array_Type,
 	^Struct_Type,
 	^Union_Type,
 	^Enum_Type,

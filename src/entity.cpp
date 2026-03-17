@@ -151,8 +151,8 @@ struct TypeNameObjCMetadata {
 };
 
 gb_internal TypeNameObjCMetadata *create_type_name_obj_c_metadata() {
-	TypeNameObjCMetadata *md = gb_alloc_item(permanent_allocator(), TypeNameObjCMetadata);
-	md->mutex = gb_alloc_item(permanent_allocator(), BlockingMutex);
+	TypeNameObjCMetadata *md = permanent_alloc_item<TypeNameObjCMetadata>();
+	md->mutex = permanent_alloc_item<BlockingMutex>();
 	array_init(&md->type_entries,  heap_allocator());
 	array_init(&md->value_entries, heap_allocator());
 	return md;
@@ -170,7 +170,7 @@ struct Entity {
 	Type *      type;
 	std::atomic<Ast *> identifier; // Can be nullptr
 	DeclInfo *  decl_info;
-	DeclInfo *  parent_proc_decl; // nullptr if in file/global scope
+	std::atomic<DeclInfo *> parent_proc_decl; // nullptr if in file/global scope
 	AstFile *   file;
 	AstPackage *pkg;
 
@@ -181,11 +181,11 @@ struct Entity {
 	Entity *    aliased_of;
 
 	union {
-		struct lbModule *code_gen_module;
+		std::atomic<struct lbModule *> code_gen_module;
 		struct cgModule *cg_module;
 	};
 	union {
-		struct lbProcedure *code_gen_procedure;
+		std::atomic<struct lbProcedure *> code_gen_procedure;
 		struct cgProcedure *cg_procedure;
 	};
 
@@ -344,18 +344,23 @@ gb_internal bool entity_has_deferred_procedure(Entity *e) {
 
 gb_global std::atomic<u64> global_entity_id;
 
+// NOTE(bill): This exists to allow for bulk allocations of entities all at once to improve performance for type generation
+#define INTERNAL_ENTITY_INIT(entity, kind_, scope_, token_, type_) do {                  \
+	(entity)->kind   = (kind_);                                                      \
+	(entity)->state  = EntityState_Unresolved;                                       \
+	(entity)->scope  = (scope_);                                                     \
+	(entity)->token  = (token_);                                                     \
+	(entity)->type   = (type_);                                                      \
+	(entity)->id     = 1 + global_entity_id.fetch_add(1);                            \
+	if ((token_).pos.file_id) {                                                      \
+		entity->file = thread_unsafe_get_ast_file_from_id((token_).pos.file_id); \
+	}                                                                                \
+} while (0)
+
+
 gb_internal Entity *alloc_entity(EntityKind kind, Scope *scope, Token token, Type *type) {
-	gbAllocator a = permanent_allocator();
-	Entity *entity = gb_alloc_item(a, Entity);
-	entity->kind   = kind;
-	entity->state  = EntityState_Unresolved;
-	entity->scope  = scope;
-	entity->token  = token;
-	entity->type   = type;
-	entity->id     = 1 + global_entity_id.fetch_add(1);
-	if (token.pos.file_id) {
-		entity->file = thread_unsafe_get_ast_file_from_id(token.pos.file_id);
-	}
+	Entity *entity = permanent_alloc_item<Entity>();
+	INTERNAL_ENTITY_INIT(entity, kind, scope, token, type);
 	return entity;
 }
 
@@ -370,7 +375,7 @@ gb_internal Entity *alloc_entity_using_variable(Entity *parent, Token token, Typ
 	token.pos = parent->token.pos;
 	Entity *entity = alloc_entity(Entity_Variable, parent->scope, token, type);
 	entity->using_parent = parent;
-	entity->parent_proc_decl = parent->parent_proc_decl;
+	entity->parent_proc_decl.store(parent->parent_proc_decl, std::memory_order_relaxed);
 	entity->using_expr = using_expr;
 	entity->flags |= EntityFlag_Using;
 	entity->flags |= EntityFlag_Used;
@@ -412,11 +417,10 @@ gb_internal Entity *alloc_entity_const_param(Scope *scope, Token token, Type *ty
 
 
 gb_internal Entity *alloc_entity_field(Scope *scope, Token token, Type *type, bool is_using, i32 field_index, EntityState state = EntityState_Unresolved) {
-	Entity *entity = alloc_entity_variable(scope, token, type);
+	Entity *entity = alloc_entity_variable(scope, token, type, state);
 	entity->Variable.field_index = field_index;
 	if (is_using) entity->flags |= EntityFlag_Using;
 	entity->flags |= EntityFlag_Field;
-	entity->state = state;
 	return entity;
 }
 

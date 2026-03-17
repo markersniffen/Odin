@@ -163,27 +163,28 @@ struct TypeStruct {
 	bool            is_packed                   : 1;
 	bool            is_raw_union                : 1;
 	bool            is_all_or_none              : 1;
+	bool            is_simple                   : 1;
 	bool            is_poly_specialized         : 1;
 
 	std::atomic<bool> are_offsets_being_processed;
 };
 
 struct TypeUnion {
-	Slice<Type *> variants;
+	Slice<Type *>    variants;
 
-	Ast *         node;
-	Scope *       scope;
+	Ast *            node;
+	Scope *          scope;
 
-	i64           variant_block_size;
-	i64           custom_align;
-	Type *        polymorphic_params; // Type_Tuple
-	Type *        polymorphic_parent;
-	Wait_Signal   polymorphic_wait_signal;
+	std::atomic<i64> variant_block_size;
+	i64              custom_align;
+	Type *           polymorphic_params; // Type_Tuple
+	Type *           polymorphic_parent;
+	Wait_Signal      polymorphic_wait_signal;
 
-	i16           tag_size;
-	bool          is_polymorphic;
-	bool          is_poly_specialized;
-	UnionTypeKind kind;
+	std::atomic<i16> tag_size;
+	bool             is_polymorphic;
+	bool             is_poly_specialized;
+	UnionTypeKind    kind;
 };
 
 struct TypeProc {
@@ -247,6 +248,12 @@ struct TypeNamed {
 	})                                                        \
 	TYPE_KIND(Slice,   struct { Type *elem; })                \
 	TYPE_KIND(DynamicArray, struct { Type *elem; })           \
+	TYPE_KIND(FixedCapacityDynamicArray, struct {             \
+		i64 capacity;                                     \
+		Type *generic_capacity;                           \
+		Type *elem;                                       \
+		i64 padding_needed; /*-1 if unknown*/             \
+	})                                                        \
 	TYPE_KIND(Map, struct {                                   \
 		Type *key;                                        \
 		Type *value;                                      \
@@ -377,6 +384,7 @@ enum Typeid_Kind : u8 {
 	Typeid_Matrix,
 	Typeid_SoaPointer,
 	Typeid_Bit_Field,
+	Typeid_Fixed_Capacity_Dynamic_Array,
 
 	Typeid__COUNT
 
@@ -697,6 +705,7 @@ gb_global Type *t_type_info_simd_vector          = nullptr;
 gb_global Type *t_type_info_matrix               = nullptr;
 gb_global Type *t_type_info_soa_pointer          = nullptr;
 gb_global Type *t_type_info_bit_field            = nullptr;
+gb_global Type *t_type_info_fixed_capacity_dynamic_array = nullptr;
 
 gb_global Type *t_type_info_named_ptr            = nullptr;
 gb_global Type *t_type_info_integer_ptr          = nullptr;
@@ -725,6 +734,7 @@ gb_global Type *t_type_info_simd_vector_ptr      = nullptr;
 gb_global Type *t_type_info_matrix_ptr           = nullptr;
 gb_global Type *t_type_info_soa_pointer_ptr      = nullptr;
 gb_global Type *t_type_info_bit_field_ptr        = nullptr;
+gb_global Type *t_type_info_fixed_capacity_dynamic_array_ptr = nullptr;
 
 gb_global Type *t_allocator                      = nullptr;
 gb_global Type *t_allocator_ptr                  = nullptr;
@@ -969,9 +979,7 @@ gb_internal void set_base_type(Type *t, Type *base) {
 
 gb_internal Type *alloc_type(TypeKind kind) {
 	// gbAllocator a = heap_allocator();
-	gbAllocator a = permanent_allocator();
-	Type *t = gb_alloc_item(a, Type);
-	gb_zero_item(t);
+	Type *t = permanent_alloc_item<Type>();
 	t->kind = kind;
 	t->cached_size  = -1;
 	t->cached_align = -1;
@@ -1066,8 +1074,8 @@ gb_internal Type *alloc_type_enumerated_array(Type *elem, Type *index, ExactValu
 	Type *t = alloc_type(Type_EnumeratedArray);
 	t->EnumeratedArray.elem = elem;
 	t->EnumeratedArray.index = index;
-	t->EnumeratedArray.min_value = gb_alloc_item(permanent_allocator(), ExactValue);
-	t->EnumeratedArray.max_value = gb_alloc_item(permanent_allocator(), ExactValue);
+	t->EnumeratedArray.min_value = permanent_alloc_item<ExactValue>();
+	t->EnumeratedArray.max_value = permanent_alloc_item<ExactValue>();
 	gb_memmove(t->EnumeratedArray.min_value, min_value, gb_size_of(ExactValue));
 	gb_memmove(t->EnumeratedArray.max_value, max_value, gb_size_of(ExactValue));
 	t->EnumeratedArray.op = op;
@@ -1092,6 +1100,23 @@ gb_internal Type *alloc_type_dynamic_array(Type *elem) {
 	t->DynamicArray.elem = elem;
 	return t;
 }
+
+gb_internal Type *alloc_type_fixed_capacity_dynamic_array(Type *elem, i64 capacity, Type *generic_capacity = nullptr) {
+	if (generic_capacity != nullptr) {
+		Type *t = alloc_type(Type_FixedCapacityDynamicArray);
+		t->FixedCapacityDynamicArray.elem = elem;
+		t->FixedCapacityDynamicArray.capacity = capacity;
+		t->FixedCapacityDynamicArray.generic_capacity = generic_capacity;
+		t->FixedCapacityDynamicArray.padding_needed = -1;
+		return t;
+	}
+	Type *t = alloc_type(Type_FixedCapacityDynamicArray);
+	t->FixedCapacityDynamicArray.elem = elem;
+	t->FixedCapacityDynamicArray.capacity = capacity;
+	t->FixedCapacityDynamicArray.padding_needed = -1;
+	return t;
+}
+
 
 
 gb_internal Type *alloc_type_struct() {
@@ -1657,6 +1682,11 @@ gb_internal bool is_type_dynamic_array(Type *t) {
 	if (t == nullptr) { return false; }
 	return t->kind == Type_DynamicArray;
 }
+gb_internal bool is_type_fixed_capacity_dynamic_array(Type *t) {
+	t = base_type(t);
+	if (t == nullptr) { return false; }
+	return t->kind == Type_FixedCapacityDynamicArray;
+}
 gb_internal bool is_type_slice(Type *t) {
 	t = base_type(t);
 	if (t == nullptr) { return false; }
@@ -1686,6 +1716,8 @@ gb_internal Type *base_array_type(Type *t) {
 		return bt->EnumeratedArray.elem;
 	} else if (is_type_simd_vector(bt)) {
 		return bt->SimdVector.elem;
+	} else if (is_type_fixed_capacity_dynamic_array(bt)) {
+		return bt->FixedCapacityDynamicArray.elem;
 	} else if (is_type_matrix(bt)) {
 		return bt->Matrix.elem;
 	}
@@ -1701,6 +1733,8 @@ gb_internal Type *base_any_array_type(Type *t) {
 		return bt->Slice.elem;
 	} else if (is_type_dynamic_array(bt)) {
 		return bt->DynamicArray.elem;
+	} else if (is_type_fixed_capacity_dynamic_array(bt)) {
+		return bt->FixedCapacityDynamicArray.elem;
 	} else if (is_type_enumerated_array(bt)) {
 		return bt->EnumeratedArray.elem;
 	} else if (is_type_simd_vector(bt)) {
@@ -2233,6 +2267,7 @@ gb_internal bool is_type_indexable(Type *t) {
 	case Type_Array:
 	case Type_Slice:
 	case Type_DynamicArray:
+	case Type_FixedCapacityDynamicArray:
 	case Type_Map:
 		return true;
 	case Type_MultiPointer:
@@ -2253,6 +2288,7 @@ gb_internal bool is_type_sliceable(Type *t) {
 	case Type_Array:
 	case Type_Slice:
 	case Type_DynamicArray:
+	case Type_FixedCapacityDynamicArray:
 		return true;
 	case Type_EnumeratedArray:
 		return false;
@@ -2393,6 +2429,11 @@ gb_internal bool is_type_polymorphic(Type *t, bool or_specialized=false) {
 		return is_type_polymorphic(t->SimdVector.elem, or_specialized);
 	case Type_DynamicArray:
 		return is_type_polymorphic(t->DynamicArray.elem, or_specialized);
+	case Type_FixedCapacityDynamicArray:
+		if (t->FixedCapacityDynamicArray.generic_capacity != nullptr) {
+			return true;
+		}
+		return is_type_polymorphic(t->FixedCapacityDynamicArray.elem, or_specialized);
 	case Type_Slice:
 		return is_type_polymorphic(t->Slice.elem, or_specialized);
 
@@ -2514,6 +2555,11 @@ gb_internal bool type_has_nil(Type *t) {
 	case Type_DynamicArray:
 	case Type_Map:
 		return true;
+
+	case Type_FixedCapacityDynamicArray:
+		// it's like a normal array, so no, similar to `#soa[N]T
+		return false;
+
 	case Type_Union:
 		return t->Union.kind != UnionType_no_nil;
 	case Type_Struct:
@@ -2641,6 +2687,9 @@ gb_internal bool is_type_comparable(Type *t) {
 	case Type_Matrix:
 		return is_type_comparable(t->Matrix.elem);
 
+	case Type_FixedCapacityDynamicArray:
+		return false;
+
 	case Type_BitSet:
 		return true;
 
@@ -2687,6 +2736,10 @@ gb_internal bool is_type_simple_compare(Type *t) {
 	case Type_EnumeratedArray:
 		return is_type_simple_compare(t->EnumeratedArray.elem);
 
+	case Type_FixedCapacityDynamicArray:
+		return false;
+		// return is_type_simple_compare(t->FixedCapacityDynamicArray.elem);
+
 	case Type_Basic:
 		if (t->Basic.flags & BasicFlag_SimpleCompare) {
 			return true;
@@ -2701,12 +2754,16 @@ gb_internal bool is_type_simple_compare(Type *t) {
 	case Type_SoaPointer:
 	case Type_Proc:
 	case Type_BitSet:
+	case Type_BitField:
 		return true;
 
 	case Type_Matrix:
 		return is_type_simple_compare(t->Matrix.elem);
 
 	case Type_Struct:
+		if (t->Struct.is_simple) {
+			return true;
+		}
 		for_array(i, t->Struct.fields) {
 			Entity *f = t->Struct.fields[i];
 			if (!is_type_simple_compare(f->type)) {
@@ -2728,6 +2785,16 @@ gb_internal bool is_type_simple_compare(Type *t) {
 	case Type_SimdVector:
 		return is_type_simple_compare(t->SimdVector.elem);
 
+	case Type_Tuple:
+		if (t->Tuple.variables.count == 1) {
+			return is_type_simple_compare(t->Tuple.variables[0]->type);
+		}
+		break;
+
+	case Type_Slice:
+	case Type_DynamicArray:
+	case Type_Map:
+		return false;
 	}
 
 	return false;
@@ -2743,6 +2810,10 @@ gb_internal bool is_type_nearly_simple_compare(Type *t) {
 	case Type_EnumeratedArray:
 		return is_type_nearly_simple_compare(t->EnumeratedArray.elem);
 
+	case Type_FixedCapacityDynamicArray:
+		return false;
+		// return is_type_nearly_simple_compare(t->FixedCapacityDynamicArray.elem);
+
 	case Type_Basic:
 		if (t->Basic.flags & (BasicFlag_SimpleCompare|BasicFlag_Numeric)) {
 			return true;
@@ -2757,12 +2828,16 @@ gb_internal bool is_type_nearly_simple_compare(Type *t) {
 	case Type_SoaPointer:
 	case Type_Proc:
 	case Type_BitSet:
+	case Type_BitField:
 		return true;
 
 	case Type_Matrix:
 		return is_type_nearly_simple_compare(t->Matrix.elem);
 
 	case Type_Struct:
+		if (t->Struct.is_simple) {
+			return true;
+		}
 		for_array(i, t->Struct.fields) {
 			Entity *f = t->Struct.fields[i];
 			if (!is_type_nearly_simple_compare(f->type)) {
@@ -2783,6 +2858,17 @@ gb_internal bool is_type_nearly_simple_compare(Type *t) {
 
 	case Type_SimdVector:
 		return is_type_nearly_simple_compare(t->SimdVector.elem);
+
+	case Type_Tuple:
+		if (t->Tuple.variables.count == 1) {
+			return is_type_nearly_simple_compare(t->Tuple.variables[0]->type);
+		}
+		break;
+
+	case Type_Slice:
+	case Type_DynamicArray:
+	case Type_Map:
+		return false;
 
 	}
 
@@ -2808,6 +2894,7 @@ gb_internal bool is_type_load_safe(Type *type) {
 	case Type_DynamicArray:
 	case Type_Proc:
 	case Type_SoaPointer:
+	case Type_FixedCapacityDynamicArray:
 		return false;
 
 	case Type_Enum:
@@ -3016,6 +3103,10 @@ gb_internal bool are_types_identical_internal(Type *x, Type *y, bool check_tuple
 
 	case Type_DynamicArray:
 		return are_types_identical(x->DynamicArray.elem, y->DynamicArray.elem);
+
+	case Type_FixedCapacityDynamicArray:
+		return (x->FixedCapacityDynamicArray.capacity == y->FixedCapacityDynamicArray.capacity) &&
+		       are_types_identical(x->FixedCapacityDynamicArray.elem, y->FixedCapacityDynamicArray.elem);
 
 	case Type_Slice:
 		return are_types_identical(x->Slice.elem, y->Slice.elem);
@@ -3282,7 +3373,7 @@ gb_internal bool union_variant_index_types_equal(Type *v, Type *vt) {
 	return false;
 }
 
-gb_internal i64 union_variant_index(Type *u, Type *v) {
+gb_internal i64 union_variant_index_checked(Type *u, Type *v) {
 	u = base_type(u);
 	GB_ASSERT(u->kind == Type_Union);
 
@@ -3296,8 +3387,23 @@ gb_internal i64 union_variant_index(Type *u, Type *v) {
 			}
 		}
 	}
-	return 0;
+	GB_PANIC("unfound variant -> %s %s", type_to_string(u), type_to_string(v));
+	return -1;
 }
+
+gb_internal bool union_is_variant_of(Type *u, Type *v) {
+	u = base_type(u);
+	GB_ASSERT(u->kind == Type_Union);
+
+	for_array(i, u->Union.variants) {
+		Type *vt = u->Union.variants[i];
+		if (union_variant_index_types_equal(v, vt)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 
 gb_internal i64 union_tag_size(Type *u) {
 	u = base_type(u);
@@ -3511,7 +3617,7 @@ gb_internal Selection lookup_field_from_index(Type *type, i64 index) {
 	return empty_selection;
 }
 
-gb_internal Entity *scope_lookup_current(Scope *s, String const &name);
+gb_internal Entity *scope_lookup_current(Scope *s, String const &name, u32 hash=0);
 gb_internal bool has_type_got_objc_class_attribute(Type *t);
 
 gb_internal Selection lookup_field_with_selection(Type *type_, String field_name, bool is_type, Selection sel, bool allow_blank_ident) {
@@ -4114,8 +4220,21 @@ gb_internal i64 type_align_of_internal(Type *t, TypePath *path) {
 	}
 
 	case Type_DynamicArray:
-		// data, count, capacity, allocator
+		// data, len, cap, allocator
 		return build_context.int_size;
+
+	case Type_FixedCapacityDynamicArray:
+		// data, len
+		{
+			Type *elem = t->FixedCapacityDynamicArray.elem;
+			bool pop = type_path_push(path, elem);
+			if (path->failure) {
+				return FAILURE_ALIGNMENT;
+			}
+			i64 align = type_align_of_internal(elem, path);
+			if (pop) type_path_pop(path);
+			return gb_max(build_context.int_size, align);
+		}
 
 	case Type_Slice:
 		return build_context.int_size;
@@ -4171,8 +4290,9 @@ gb_internal i64 type_align_of_internal(Type *t, TypePath *path) {
 		if (t->Struct.is_packed) {
 			return 1;
 		}
-
-		type_set_offsets(t);
+		// Avoid forcing offset computation here. The caller's type-path state must
+		// be able to detect recursive field cycles before any nested struct tries to
+		// re-enter this struct's offset mutex.
 
 		i64 max = 1;
 		for_array(i, t->Struct.fields) {
@@ -4278,17 +4398,17 @@ gb_internal i64 *type_set_offsets_of(Slice<Entity *> const &fields, bool is_pack
 gb_internal bool type_set_offsets(Type *t) {
 	t = base_type(t);
 	if (t->kind == Type_Struct) {
-		if (t->Struct.are_offsets_being_processed.load()) {
-			return true;
-		}
+		// if (t->Struct.are_offsets_being_processed.load()) {
+		// 	return true;
+		// }
 		MUTEX_GUARD(&t->Struct.offset_mutex);
 		if (!t->Struct.are_offsets_set) {
 			t->Struct.are_offsets_being_processed.store(true);
 			t->Struct.offsets = type_set_offsets_of(t->Struct.fields, t->Struct.is_packed, t->Struct.is_raw_union, t->Struct.custom_min_field_align, t->Struct.custom_max_field_align);
 			t->Struct.are_offsets_being_processed.store(false);
 			t->Struct.are_offsets_set = true;
-			return true;
 		}
+		return true;
 	} else if (is_type_tuple(t)) {
 		MUTEX_GUARD(&t->Tuple.mutex);
 		if (!t->Tuple.are_offsets_set) {
@@ -4296,8 +4416,8 @@ gb_internal bool type_set_offsets(Type *t) {
 			t->Tuple.offsets = type_set_offsets_of(t->Tuple.variables, t->Tuple.is_packed, false, 1, 0);
 			t->Tuple.are_offsets_being_processed.store(false);
 			t->Tuple.are_offsets_set = true;
-			return true;
 		}
+		return true;
 	} else {
 		GB_PANIC("Invalid type for setting offsets");
 	}
@@ -4387,6 +4507,31 @@ gb_internal i64 type_size_of_internal(Type *t, TypePath *path) {
 	case Type_DynamicArray:
 		// data + len + cap + allocator(procedure+data)
 		return 3*build_context.int_size + 2*build_context.ptr_size;
+
+	case Type_FixedCapacityDynamicArray:
+		{
+			// data + len
+			i64 capacity = t->FixedCapacityDynamicArray.capacity;
+			Type *elem = t->FixedCapacityDynamicArray.elem;
+			i64 align = type_align_of_internal(elem, path);
+			if (path->failure) {
+				return FAILURE_SIZE;
+			}
+			align = gb_max(build_context.int_size, align);
+
+			i64 size = type_size_of(elem);
+			size *= capacity;
+
+			i64 old_size = size;
+			size = align_formula(size, build_context.int_size);
+
+			i64 padding = size - old_size;
+			t->FixedCapacityDynamicArray.padding_needed = padding;
+
+			size += 1*build_context.int_size;
+			size = align_formula(size, align);
+			return size;
+		}
 
 	case Type_Map:
 		/*
@@ -4613,6 +4758,24 @@ gb_internal i64 type_offset_of(Type *t, i64 index, Type **field_type_) {
 			return 3*build_context.int_size; // allocator
 		}
 		break;
+
+	case Type_FixedCapacityDynamicArray:
+		switch (index) {
+		case 0:
+			if (field_type_) *field_type_ = alloc_type_array(t->FixedCapacityDynamicArray.elem, t->FixedCapacityDynamicArray.capacity);
+			return 0;                        // data
+
+		case 1: // len
+			if (field_type_) *field_type_ = t_int;
+			{
+				i64 elem_size = type_size_of(t->FixedCapacityDynamicArray.elem);
+				i64 offset = 0;
+				offset = elem_size * t->FixedCapacityDynamicArray.capacity;
+				offset = align_formula(offset, build_context.int_size);
+				return offset;
+			}
+		}
+		break;
 	case Type_Union:
 		if (!is_type_union_maybe_pointer(t)) {
 			/* i64 s = */ type_size_of(t);
@@ -4678,6 +4841,12 @@ gb_internal i64 type_offset_of_from_selection(Type *type, Selection sel) {
 				case 1: t = t_int;       break;
 				case 2: t = t_int;       break;
 				case 3: t = t_allocator; break;
+				}
+				break;
+			case Type_FixedCapacityDynamicArray:
+				switch (index) {
+				case 0: t = alloc_type_array(t->FixedCapacityDynamicArray.elem, t->FixedCapacityDynamicArray.capacity); break;
+				case 1: t = t_int; break;
 				}
 				break;
 			}
@@ -4939,6 +5108,15 @@ gb_internal Type *type_internal_index(Type *t, isize index) {
 			default: GB_PANIC("invalid raw dynamic array index");
 			};
 		}
+
+	case Type_FixedCapacityDynamicArray:
+		{
+			switch (index) {
+			case 0: t = alloc_type_array(t->FixedCapacityDynamicArray.elem, t->FixedCapacityDynamicArray.capacity); break;
+			case 1:  return t_int;
+			default: GB_PANIC("invalid raw fixed capacity dynamic array index");
+			};
+		}
 	case Type_Struct:
 		return get_struct_field_type(bt, index);
 	case Type_Union:
@@ -5037,6 +5215,13 @@ gb_internal gbString write_type_to_string(gbString str, Type *type, bool shortha
 		str = write_type_to_string(str, type->DynamicArray.elem, shorthand, allow_polymorphic);
 		break;
 
+	case Type_FixedCapacityDynamicArray:
+		str = gb_string_appendc(str, "[dynamic; ");
+		str = gb_string_appendc(str, gb_bprintf("%lld", cast(long long)type->FixedCapacityDynamicArray.capacity));
+		str = gb_string_appendc(str, "]");
+		str = write_type_to_string(str, type->FixedCapacityDynamicArray.elem, shorthand, allow_polymorphic);
+		break;
+
 	case Type_Enum:
 		str = gb_string_appendc(str, "enum");
 		if (type->Enum.base_type != nullptr) {
@@ -5099,9 +5284,11 @@ gb_internal gbString write_type_to_string(gbString str, Type *type, bool shortha
 			str = gb_string_appendc(str, ")");
 		}
 
-		if (type->Struct.is_packed)    str = gb_string_appendc(str, " #packed");
-		if (type->Struct.is_raw_union) str = gb_string_appendc(str, " #raw_union");
+		if (type->Struct.is_packed)         str = gb_string_appendc(str, " #packed");
+		if (type->Struct.is_raw_union)      str = gb_string_appendc(str, " #raw_union");
 		if (type->Struct.custom_align != 0) str = gb_string_append_fmt(str, " #align %d", cast(int)type->Struct.custom_align);
+		if (type->Struct.is_all_or_none)    str = gb_string_appendc(str, " #all_or_none");
+		if (type->Struct.is_simple)         str = gb_string_appendc(str, " #simple");
 
 		str = gb_string_appendc(str, " {");
 

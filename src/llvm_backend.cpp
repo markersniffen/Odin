@@ -66,6 +66,19 @@ gb_internal String get_final_microarchitecture() {
 gb_internal String get_default_features() {
 	BuildContext *bc = &build_context;
 
+	if (bc->microarch == str_lit("native")) {
+		String features = make_string_c(LLVMGetHostCPUFeatures());
+
+		// Update the features string so LLVM uses it later.
+		if (bc->target_features_string.len > 0) {
+			bc->target_features_string = concatenate3_strings(permanent_allocator(), features, str_lit(","), bc->target_features_string);
+		} else {
+			bc->target_features_string = features;
+		}
+
+		return features;
+	}
+
 	int off = 0;
 	for (int i = 0; i < bc->metrics.arch; i += 1) {
 		off += target_microarch_counts[i];
@@ -171,7 +184,7 @@ gb_internal void lb_correct_entity_linkage(lbGenerator *gen) {
 		LLVMValueRef other_global = nullptr;
 		if (ec.e->kind == Entity_Variable) {
 			other_global = LLVMGetNamedGlobal(ec.other_module->mod, ec.cname);
-			if (other_global) {
+			if (other_global && (LLVMGetInitializer(other_global) != nullptr || LLVMIsExternallyInitialized(other_global))) {
 				LLVM_SET_INTERNAL_WEAK_LINKAGE(other_global);
 				if (!ec.e->Variable.is_export && !ec.e->Variable.is_foreign) {
 					LLVMSetVisibility(other_global, LLVMHiddenVisibility);
@@ -179,7 +192,7 @@ gb_internal void lb_correct_entity_linkage(lbGenerator *gen) {
 			}
 		} else if (ec.e->kind == Entity_Procedure) {
 			other_global = LLVMGetNamedFunction(ec.other_module->mod, ec.cname);
-			if (other_global) {
+			if (other_global && LLVMCountBasicBlocks(other_global) != 0) {
 				LLVM_SET_INTERNAL_WEAK_LINKAGE(other_global);
 				if (!ec.e->Procedure.is_export && !ec.e->Procedure.is_foreign) {
 					LLVMSetVisibility(other_global, LLVMHiddenVisibility);
@@ -239,9 +252,9 @@ gb_internal lbContextData *lb_push_context_onto_stack(lbProcedure *p, lbAddr ctx
 
 gb_internal String lb_internal_gen_name_from_type(char const *prefix, Type *type) {
 	gbString str = gb_string_make(permanent_allocator(), prefix);
-	u64 hash = type_hash_canonical_type(type);
-	str = gb_string_appendc(str, "-");
-	str = gb_string_append_fmt(str, "%llu", cast(unsigned long long)hash);
+	str = gb_string_appendc(str, "$$");
+	gbString ct = temp_canonical_string(type);
+	str = gb_string_append_length(str, ct, gb_string_length(ct));
 	String proc_name = make_string(cast(u8 const *)str, gb_string_length(str));
 	return proc_name;
 }
@@ -2045,6 +2058,11 @@ gb_internal bool lb_init_global_var(lbModule *m, lbProcedure *p, Entity *e, Ast 
 			lb_emit_store(p, data, lb_emit_conv(p, gp, t_rawptr));
 			lb_emit_store(p, ti,   lb_typeid(p->module, var_type));
 		} else {
+			i64 sz = type_size_of(e->type);
+			if (sz >= 4 * 1024) {
+				warning(init_expr, "[Possible Code Generation Issue] Non-constant initialization is large (%lld bytes), and might cause problems with LLVM", cast(long long)sz);
+			}
+
 			LLVMTypeRef vt = llvm_addr_type(p->module, var.var);
 			lbValue src0 = lb_emit_conv(p, var.init, t);
 			LLVMValueRef src = OdinLLVMBuildTransmute(p, src0.value, vt);
@@ -2327,7 +2345,12 @@ gb_internal WORKER_TASK_PROC(lb_llvm_emit_worker_proc) {
 
 	auto wd = cast(lbLLVMEmitWorker *)data;
 
-	if (LLVMTargetMachineEmitToFile(wd->target_machine, wd->m->mod, cast(char *)wd->filepath_obj.text, wd->code_gen_file_type, &llvm_error)) {
+	if (build_context.lto_kind != LTO_None) {
+		if (LLVMWriteBitcodeToFile(wd->m->mod, cast(char *)wd->filepath_obj.text)) {
+			gb_printf_err("Failed to write bitcode file: %.*s\n", LIT(wd->filepath_obj));
+			exit_with_errors();
+		}
+	} else if (LLVMTargetMachineEmitToFile(wd->target_machine, wd->m->mod, cast(char *)wd->filepath_obj.text, wd->code_gen_file_type, &llvm_error)) {
 		gb_printf_err("LLVM Error: %s\n", llvm_error);
 		exit_with_errors();
 	}
@@ -2444,14 +2467,21 @@ gb_internal WORKER_TASK_PROC(lb_llvm_module_pass_worker_proc) {
 	// tsan - Linux, Darwin
 	// ubsan - Linux, Darwin, Windows (NOT SUPPORTED WITH LLVM C-API)
 
-	if (build_context.sanitizer_flags & SanitizerFlag_Address) {
-		array_add(&passes, "asan");
-	}
-	if (build_context.sanitizer_flags & SanitizerFlag_Memory) {
-		array_add(&passes, "msan");
-	}
-	if (build_context.sanitizer_flags & SanitizerFlag_Thread) {
-		array_add(&passes, "tsan");
+	// With LTO, sanitizer passes run at link time (via -fsanitize= linker flags)
+	// where the linker has whole-program visibility. Running them here too would
+	// double-instrument every module, producing "Redundant instrumentation" warnings.
+	// Per-function sanitize attributes in the bitcode are preserved and respected
+	// by the linker's sanitizer pass.
+	if (build_context.lto_kind == LTO_None) {
+		if (build_context.sanitizer_flags & SanitizerFlag_Address) {
+			array_add(&passes, "asan");
+		}
+		if (build_context.sanitizer_flags & SanitizerFlag_Memory) {
+			array_add(&passes, "msan");
+		}
+		if (build_context.sanitizer_flags & SanitizerFlag_Thread) {
+			array_add(&passes, "tsan");
+		}
 	}
 
 	if (passes.count == 0) {
@@ -2617,7 +2647,7 @@ gb_internal void lb_llvm_module_passes_and_verification(lbGenerator *gen, bool d
 	if (do_threading) {
 		for (auto const &entry : gen->modules) {
 			lbModule *m = entry.value;
-			auto wd = gb_alloc_item(permanent_allocator(), lbLLVMModulePassWorkerData);
+			auto wd = permanent_alloc_item<lbLLVMModulePassWorkerData>();
 			wd->m = m;
 			wd->target_machine = m->target_machine;
 			wd->do_threading = true;
@@ -2628,7 +2658,7 @@ gb_internal void lb_llvm_module_passes_and_verification(lbGenerator *gen, bool d
 	} else {
 		for (auto const &entry : gen->modules) {
 			lbModule *m = entry.value;
-			auto wd = gb_alloc_item(permanent_allocator(), lbLLVMModulePassWorkerData);
+			auto wd = permanent_alloc_item<lbLLVMModulePassWorkerData>();
 			wd->m = m;
 			wd->target_machine = m->target_machine;
 			wd->do_threading = false;
@@ -2696,7 +2726,9 @@ gb_internal String lb_filepath_obj_for_module(lbModule *m) {
 
 	String ext = {};
 
-	if (build_context.build_mode == BuildMode_Assembly) {
+	if (build_context.lto_kind != LTO_None) {
+		ext = STR_LIT("bc");
+	} else if (build_context.build_mode == BuildMode_Assembly) {
 		ext = STR_LIT("S");
 	} else if (build_context.build_mode == BuildMode_Object) {
 		// Allow a user override for the object extension.
@@ -2746,7 +2778,7 @@ gb_internal bool lb_llvm_object_generation(lbGenerator *gen, bool do_threading) 
 			array_add(&gen->output_object_paths, filepath_obj);
 			array_add(&gen->output_temp_paths, filepath_ll);
 
-			auto *wd = gb_alloc_item(permanent_allocator(), lbLLVMEmitWorker);
+			auto *wd = permanent_alloc_item<lbLLVMEmitWorker>();
 			wd->target_machine = m->target_machine;
 			wd->code_gen_file_type = code_gen_file_type;
 			wd->filepath_obj = filepath_obj;
@@ -2771,7 +2803,13 @@ gb_internal bool lb_llvm_object_generation(lbGenerator *gen, bool do_threading) 
 
 			TIME_SECTION_WITH_LEN(section_name, gb_string_length(section_name));
 
-			if (LLVMTargetMachineEmitToFile(m->target_machine, m->mod, cast(char *)filepath_obj.text, code_gen_file_type, &llvm_error)) {
+			if (build_context.lto_kind != LTO_None) {
+				if (LLVMWriteBitcodeToFile(m->mod, cast(char *)filepath_obj.text)) {
+					gb_printf_err("Failed to write bitcode file: %.*s\n", LIT(filepath_obj));
+					exit_with_errors();
+					return false;
+				}
+			} else if (LLVMTargetMachineEmitToFile(m->target_machine, m->mod, cast(char *)filepath_obj.text, code_gen_file_type, &llvm_error)) {
 				gb_printf_err("LLVM Error: %s\n", llvm_error);
 				exit_with_errors();
 				return false;
@@ -3149,7 +3187,9 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			code_mode);
 		lbModule *m = entry.value;
 		m->target_machine = target_machine;
-		LLVMSetModuleDataLayout(m->mod, LLVMCreateTargetDataLayout(target_machine));
+		LLVMTargetDataRef data_layout = LLVMCreateTargetDataLayout(target_machine);
+		LLVMSetModuleDataLayout(m->mod, data_layout);
+		LLVMDisposeTargetData(data_layout);
 
 	#if LLVM_VERSION_MAJOR >= 18
 		if (build_context.fast_isel) {
@@ -3558,6 +3598,7 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			lb_add_raddbg_string(m, "type_view: {type: \"[]?\",        expr: \"array(data, len)\"}");
 			lb_add_raddbg_string(m, "type_view: {type: \"string\",     expr: \"array(data, len)\"}");
 			lb_add_raddbg_string(m, "type_view: {type: \"[dynamic]?\", expr: \"rows($, array(data, len), len, cap, allocator)\"}");
+			lb_add_raddbg_string(m, "type_view: {type: \"[dynamic;?]?\", expr: \"rows($, array(data, len), len)\"}");
 
 			// column major matrices
 			lb_add_raddbg_string(m, "type_view: {type: \"matrix[1, ?]?\",  expr: \"columns($.data, $[0])\"}");

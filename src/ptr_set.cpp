@@ -19,7 +19,8 @@ template <typename T> gb_internal void ptr_set_clear  (PtrSet<T> *s);
 #define FOR_PTR_SET(element, set_) for (auto *it = &(set_).keys[0], element = it ? *it : nullptr; (set_).keys != nullptr && it < &(set_).keys[(set_).capacity]; it++) if (element = *it, (*it != nullptr && *it != cast(void *)~(uintptr)(0ull)))
 
 gb_internal gbAllocator ptr_set_allocator(void) {
-	return heap_allocator();
+	// return heap_allocator();
+	return permanent_allocator();
 }
 
 template <typename T>
@@ -122,10 +123,11 @@ gb_internal bool ptr_set_update(PtrSet<T> *s, T ptr) { // returns true if it pre
 	usize hash_index = (cast(usize)hash) & mask;
 	GB_ASSERT(hash_index < s->capacity);
 	for (usize i = 0; i < s->capacity; i++) {
-		T *key = &s->keys[hash_index];
-		GB_ASSERT(*key != ptr);
-		if (*key == (T)PtrSet<T>::TOMBSTONE || *key == 0) {
-			*key = ptr;
+		T *key_ptr = &s->keys[hash_index];
+		T key = *key_ptr;
+		GB_ASSERT(key != ptr);
+		if (key == (T)PtrSet<T>::TOMBSTONE || key == 0) {
+			*key_ptr = ptr;
 			s->count++;
 			return false;
 		}
@@ -160,10 +162,11 @@ gb_internal bool ptr_set_update_with_mutex(PtrSet<T> *s, T ptr, RWSpinLock *m) {
 	usize hash_index = (cast(usize)hash) & mask;
 	GB_ASSERT(hash_index < s->capacity);
 	for (usize i = 0; i < s->capacity; i++) {
-		T *key = &s->keys[hash_index];
-		GB_ASSERT(*key != ptr);
-		if (*key == (T)PtrSet<T>::TOMBSTONE || *key == 0) {
-			*key = ptr;
+		T *key_ptr = &s->keys[hash_index];
+		T key = *key_ptr;
+		GB_ASSERT(key != ptr);
+		if (key == (T)PtrSet<T>::TOMBSTONE || key == 0) {
+			*key_ptr = ptr;
 			s->count++;
 			return false;
 		}
