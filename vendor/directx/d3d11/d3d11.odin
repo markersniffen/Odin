@@ -44,6 +44,18 @@ foreign d3d11 {
 		pFeatureLevel:      ^FEATURE_LEVEL,
 		ppImmediateContext: ^^IDeviceContext,
 	) -> HRESULT ---
+	On12CreateDevice :: proc(
+		pDevice:           ^rawptr,
+		Flags:              CREATE_DEVICE_FLAGS,
+		pFeatureLevels:     [^]FEATURE_LEVEL,
+		FeatureLevels:      u32,
+		ppCommandQueues:    ^rawptr,
+		NumQueues:          u32,
+		NodeMask:           u32,
+		ppDevice:           ^^IDevice,
+		ppImmediateContext: ^^IDeviceContext,
+		pChosenFeatureLevel:^FEATURE_LEVEL,
+	) -> HRESULT ---
 	CreateDeviceAndSwapChain :: proc(
 		pAdapter:           ^dxgi.IAdapter,
 		DriverType:         DRIVER_TYPE,

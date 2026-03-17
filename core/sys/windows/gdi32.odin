@@ -76,6 +76,8 @@ foreign gdi32 {
 	GdiTransparentBlt :: proc(hdcDest: HDC, xoriginDest, yoriginDest, wDest, hDest: INT, hdcSrc: HDC, xoriginSrc, yoriginSrc, wSrc, hSrc: INT, crTransparent: UINT) -> BOOL ---
 	GdiGradientFill   :: proc(hdc: HDC, pVertex: PTRIVERTEX, nVertex: ULONG, pMesh: PVOID, nCount: ULONG, ulMode: ULONG) -> BOOL ---
 	GdiAlphaBlend     :: proc(hdcDest: HDC, xoriginDest, yoriginDest, wDest, hDest: INT, hdcSrc: HDC, xoriginSrc, yoriginSrc, wSrc, hSrc: INT, ftn: BLENDFUNCTION) -> BOOL ---
+
+	CreateBitmap      :: proc(nWidth, nHeight: INT, nPlanes, nBitCount: UINT, lpBits: rawptr) -> HBITMAP ---
 }
 
 @(require_results)

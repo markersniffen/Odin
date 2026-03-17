@@ -5664,3 +5664,4 @@ IFunctionParameterReflection :: struct {
 IFunctionParameterReflection_VTable :: struct {
 	GetDesc: proc "system" (this: ^IFunctionParameterReflection, pDesc: ^PARAMETER_DESC) -> HRESULT,
 }
+

@@ -381,6 +381,7 @@ foreign kernel32 {
 	FindClose                       :: proc(findFile: HANDLE) -> BOOL ---
 	GetModuleHandleW                :: proc(lpModuleName: LPCWSTR) -> HMODULE ---
 	GetModuleHandleA                :: proc(lpModuleName: LPCSTR) -> HMODULE ---
+	GetSystemTimes                  :: proc(lpIdleTime, lpKerneltime, lpUsertime: ^FILETIME) -> BOOL ---
 	GetSystemTimeAsFileTime         :: proc(lpSystemTimeAsFileTime: LPFILETIME) ---
 	GetSystemTimePreciseAsFileTime  :: proc(lpSystemTimeAsFileTime: LPFILETIME) ---
 	FileTimeToSystemTime            :: proc(lpFileTime: ^FILETIME, lpSystemTime: ^SYSTEMTIME) -> BOOL ---
